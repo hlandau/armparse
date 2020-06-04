@@ -1,0 +1,1949 @@
+#!/usr/bin/env python3
+import sys, argparse, re, pickle, os.path, glob
+import xml.etree.ElementTree as ET
+from typing import NamedTuple
+from aslutil import *
+import armtrans
+
+def readASL(ps):
+  name = ps.attrib['name']
+  name = name.replace('.txt','')
+  #name = name.replace('/instrs', '')
+  #name = name.replace('/Op_', '/')
+  chunk = ps.find('pstext')
+
+  rep_section = chunk.attrib['rep_section']
+
+  defs = {x.attrib['link'] for x in chunk.findall('anchor')}
+  deps = {x.attrib['link'] for x in chunk.findall('a') if not x.text.startswith('SEE')}
+
+  deps = {re.sub('(impl-\w+\.)', '', x) for x in deps}
+  defs = {re.sub('(impl-\w+\.)', '', x) for x in defs}
+
+  deps = {re.sub('([^#]+#)', '', x) for x in deps}
+
+  return ASL(name, rep_section, ET.tostring(chunk, method='text').decode().rstrip() + "\n", defs, deps)
+
+def readDocument(fn):
+  xml = ET.parse(fn)
+  L = []
+
+  root = xml.find('.')
+  if root.tag != 'instructionsection':
+    return L
+
+  if root.attrib.get('type') == 'alias':
+    return L
+
+  for ps in xml.findall('.//ps_section/ps'):
+    L.append(readASL(ps))
+
+  return L
+
+#def readShared(files):
+#  asl = {}
+#  for f in files:
+#    xml = ET.parse(f)
+#    for ps in xml.findall('.//ps_section/ps'):
+#      r = readASL(ps)
+#      asl[r.name] = r
+#  return asl
+
+def readDir(inDir):
+  asl = {}
+
+  files = glob.glob(os.path.join(inDir, '*.xml'))
+  files.sort()
+  for f in files:
+    bn = os.path.basename(f)
+    if bn == 'onebigfile.xml':
+      continue
+
+    rs = readDocument(f)
+    for r in rs:
+      asl[r.name] = r
+
+  return asl
+
+
+## Lexer                                                                   {{{1
+###############################################################################
+
+class Lexer(object):
+  def __init__(self, src):
+    self.src = src
+    self.state = 's_drifting'
+    self.c = None
+    self.reissue = 0
+    self.s = ''
+    self.i = 0
+    self.indStack = [0]
+    self.spaces = 0
+    self.spacesDone = False
+    self.lineNo = 1
+    self.colNo = 0
+    self.returned = []
+    self.inhibitIndent = 0
+
+  def push(self, tok):
+    self.returned.append(tok)
+
+  def save(self):
+    d = {}
+    for k in ['src', 'state', 'c', 'reissue', 's', 'i', 'indStack', 'spaces', 'spacesDone', 'lineNo', 'colNo', 'returned', 'inhibitIndent']:
+      if isinstance(getattr(self, k), list):
+        d[k] = getattr(self, k).copy()
+      else:
+        d[k] = getattr(self, k)
+    return d
+
+  def restore(self, d):
+    for k in ['src', 'state', 'c', 'reissue', 's', 'i', 'indStack', 'spaces', 'spacesDone', 'lineNo', 'colNo', 'returned', 'inhibitIndent']:
+      setattr(self, k, d[k])
+
+  @property
+  def eof(self):
+    return len(self.src) == 0
+
+  def read(self):
+    t, isNew = self._read()
+    if isNew:
+      pass
+      #print(t)
+    return t
+
+  def _read(self):
+    if len(self.returned) > 0:
+      t = self.returned[0]
+      self.returned = self.returned[1:]
+      return t, False
+
+    while len(self.src) > 0:
+      if self.reissue > 0:
+        self.reissue -= 1
+      else:
+        self.c   = self.src[0]
+        self.src = self.src[1:]
+        self.colNo += 1
+
+      t = getattr(self, self.state)()
+      if t is not None:
+        return t, True
+
+    if len(self.indStack) > 1:
+      self.indStack.pop()
+      return self.mk(tokDEDENT), True
+
+    return self.mk(tokEOF), True
+
+  def mk(self, ty, arg=None):
+    return Token(ty, arg, self.lineNo, self.colNo)
+
+  def flushSpaces(self):
+    if not self.spacesDone and self.inhibitIndent <= 0:
+      if self.indStack[-1] < self.spaces:
+        self.indStack.append(self.spaces)
+        self.reissue += 1
+        self.spacesDone = True
+        return self.mk(tokINDENT)
+
+      if self.indStack[-1] > self.spaces:
+        if len(self.indStack) <= 1:
+          raise Exception('invalid dedent')
+
+        L = self.indStack[-1]
+        if L < self.spaces:
+          raise Exception('invalid dedent')
+
+        self.indStack.pop()
+        self.reissue += 1
+        return self.mk(tokDEDENT)
+
+      self.spacesDone = True
+
+  def s_drifting(self):
+    if self.c == ' ':
+      if not self.spacesDone and self.inhibitIndent <= 0:
+        self.spaces += 1
+      return
+    if self.c == '\t':
+      if not self.spacesDone and self.inhibitIndent <= 0:
+        self.spaces += 8
+      return
+
+    if self.c == '\r' or self.c == '\n':
+      if self.inhibitIndent <= 0:
+        self.spaces = 0
+        self.spacesDone = False
+      self.colNo = 0
+      self.lineNo += 1
+      return
+
+    if self.c == '/':
+      self.state = 's_slash'
+      return
+
+    r = self.flushSpaces()
+    if r is not None:
+      return r
+
+    if self.c == '=':
+      self.state = 's_eq'
+      return
+
+    if (self.c >= 'a' and self.c <= 'z') or (self.c >= 'A' and self.c <= 'Z') or self.c == '_':
+      self.reissue += 1
+      self.state = 's_id'
+      return
+
+    if self.c == '.':
+      self.state = 's_period'
+      return
+
+    if self.c == '(':
+      return self.mk(tokLPAREN)
+    if self.c == ')':
+      return self.mk(tokRPAREN)
+    if self.c == '{':
+      return self.mk(tokLBRACE)
+    if self.c == '}':
+      return self.mk(tokRBRACE)
+    if self.c == ';':
+      return self.mk(tokSEMICOLON)
+    #if self.c == '.':
+    #  return self.mk(tokPERIOD)
+    if self.c == '<':
+      self.state = 's_lt'
+      return
+    if self.c == '>':
+      self.state = 's_gt'
+      return
+    if self.c == ':':
+      return self.mk(tokCOLON)
+    if self.c == ',':
+      return self.mk(tokCOMMA)
+
+    if self.c > '0' and self.c <= '9':
+      self.reissue += 1
+      self.state = 's_int'
+      return
+
+    if self.c == '0':
+      self.state = 's_int0'
+      return
+
+    if self.c == '&':
+      self.state = 's_ampersand'
+      return
+
+    if self.c == '|':
+      self.state = 's_pipe'
+      return
+
+    if self.c == '!':
+      self.state = 's_bang'
+      return
+
+    if self.c == '+':
+      self.state = 's_plus'
+      return
+
+    if self.c == '-':
+      self.state = 's_minus'
+      return
+
+    if self.c == '*':
+      self.state = 's_asterisk'
+      return
+
+    if self.c == '^':
+      self.state = 's_caret'
+      return
+
+    if self.c == "'":
+      self.state = 's_bitstring'
+      return
+
+    if self.c == '"':
+      self.state = 's_qstring'
+      return
+
+    if self.c == '[':
+      return self.mk(tokLBRACKET)
+    if self.c == ']':
+      return self.mk(tokRBRACKET)
+
+    raise Exception('unknown character: %s' % repr(self.c))
+
+  def s_id(self):
+    if self.c >= 'a' and self.c <= 'z' or self.c >= 'A' and self.c <= 'Z' or self.c >= '0' and self.c <= '9' or self.c == '_':
+      self.s += self.c
+      return
+
+    self.reissue += 1
+    s = self.s
+    self.s = ''
+    self.state = 's_drifting'
+    if s in keywords:
+      return self.mk(keywords[s])
+    return self.mk(tokIDENT, s)
+
+  def s_eq(self):
+    self.state = 's_drifting'
+
+    if self.c == '=':
+      return self.mk(tokEQEQ)
+
+    self.reissue += 1
+    return self.mk(tokEQ)
+
+  def s_int(self):
+    if self.c >= '0' and self.c <= '9':
+      self.i = self.i*10 + ord(self.c) - ord('0')
+      return
+
+    if self.c == '.':
+      self.state = 's_decimalentry'
+      return
+
+    self.reissue += 1
+    self.state = 's_drifting'
+    i = self.i
+    self.i = 0
+    return self.mk(tokINT, i)
+
+  def s_decimalentry(self):
+    if self.c == '.':
+      self.reissue += 1
+      self.state = 's_period'
+
+      i = self.i
+      self.i = 0
+      return self.mk(tokINT, i)
+
+    self.reissue += 1
+    self.state = 's_decimal'
+
+  def s_decimal(self):
+    if self.c >= '0' and self.c <= '9':
+      self.s += self.c
+      return
+
+    i = float(str(self.i) + '.' + self.s)
+    self.reissue += 1
+    self.state = 's_drifting'
+    self.i = 0
+    self.s = ''
+    return self.mk(tokFLOAT, i)
+
+  def s_int0(self):
+    if self.c == '.':
+      self.state = 's_decimalentry'
+      return
+
+    if self.c >= '0' and self.c <= '7':
+      raise Exception('octal not supported TODO')
+
+    if self.c == '8' or self.c == '9':
+      raise Exception('octal literal contains non-octal digits')
+
+    if self.c == 'x':
+      self.state = 's_inthex'
+      return
+
+    self.state = 's_drifting'
+    self.reissue += 1
+    return self.mk(tokINT, 0)
+
+  def s_inthex(self):
+    if self.c >= '0' and self.c <= '9':
+      self.i = self.i*16 + ord(self.c) - ord('0')
+      return
+
+    if self.c >= 'a' and self.c <= 'f':
+      self.i = self.i*16 + ord(self.c) - ord('a') + 10
+      return
+
+    if self.c >= 'A' and self.c <= 'F':
+      self.i = self.i*16 + ord(self.c) - ord('A') + 10
+      return
+
+    self.reissue += 1
+    self.state = 's_drifting'
+    i = self.i
+    self.i = 0
+    return self.mk(tokINT, i)
+
+  def s_slash(self):
+    if self.c == '/':
+      self.state = 's_linecomment'
+      return
+
+    r = self.flushSpaces()
+    if r is not None:
+      return r
+
+    if self.c == '*':
+      self.state = 's_blockcomment'
+      return
+
+    self.reissue += 1
+    self.state = 's_drifting'
+    return self.mk(tokSLASH)
+
+  def s_ampersand(self):
+    if self.c == '&':
+      self.state = 's_drifting'
+      return self.mk(tokLAND)
+    
+    self.reissue += 1
+    self.state = 's_drifting'
+    return self.mk(tokAMPERSAND)
+
+  def s_pipe(self):
+    if self.c == '|':
+      self.state = 's_drifting'
+      return self.mk(tokLOR)
+
+    self.reissue += 1
+    self.state = 's_drifting'
+    return self.mk(tokPIPE)
+
+  def s_bang(self):
+    if self.c == '=':
+      self.state = 's_drifting'
+      return self.mk(tokNE)
+
+    self.reissue += 1
+    self.state = 's_drifting'
+    return self.mk(tokBANG)
+
+  def s_plus(self):
+    if self.c == ':':
+      self.state = 's_drifting'
+      return self.mk(tokPLUSCOLON)
+
+    self.reissue += 1
+    self.state = 's_drifting'
+    return self.mk(tokPLUS)
+
+  def s_minus(self):
+    self.reissue += 1
+    self.state = 's_drifting'
+    return self.mk(tokMINUS)
+
+  def s_asterisk(self):
+    self.reissue += 1
+    self.state = 's_drifting'
+    return self.mk(tokASTERISK)
+
+  def s_caret(self):
+    self.reissue += 1
+    self.state = 's_drifting'
+    return self.mk(tokCARET)
+
+  def s_lt(self):
+    if self.c == '=':
+      self.state = 's_drifting'
+      return self.mk(tokLE)
+
+    if self.c == '<':
+      self.state = 's_drifting'
+      return self.mk(tokLSH)
+
+    self.reissue += 1
+    self.state = 's_drifting'
+    return self.mk(tokLT)
+
+  def s_gt(self):
+    if self.c == '=':
+      self.state = 's_drifting'
+      return self.mk(tokGE)
+
+    if self.c == '>':
+      self.state = 's_drifting'
+      return self.mk(tokRSH)
+
+    self.reissue += 1
+    self.state = 's_drifting'
+    return self.mk(tokGT)
+
+  def s_bitstring(self):
+    if self.c >= '0' and self.c <= '1' or self.c == 'x':
+      self.s += self.c
+      return
+
+    if self.c == "'":
+      s = self.s
+      self.s = ''
+      self.state = 's_drifting'
+      return self.mk(tokBITSTRING, s)
+
+    if self.c == ' ':
+      return
+
+    raise Exception('unknown character: %s' % self.c)
+
+  def s_qstring(self):
+    if self.c == '"':
+      s = self.s
+      self.s = ''
+      self.state = 's_drifting'
+      return self.mk(tokQSTRING, s)
+
+    self.s += self.c
+    return
+
+  def s_linecomment(self):
+    if self.c == '\n':
+      self.state = 's_drifting'
+      self.reissue += 1
+      return
+
+  def s_blockcomment(self):
+    if self.c == '*':
+      self.state = 's_blockcomment2'
+      return
+
+  def s_blockcomment2(self):
+    if self.c == '/':
+      self.state = 's_drifting'
+      return
+
+    if self.c == '*':
+      return
+
+    self.state = 's_blockcomment'
+    return
+
+  def s_period(self):
+    if self.c == '.':
+      self.state = 's_drifting'
+      return self.mk(tokPERIODPERIOD)
+
+    self.reissue += 1
+    self.state = 's_drifting'
+    return self.mk(tokPERIOD)
+
+
+## Parser                                                                  {{{1
+###############################################################################
+#
+# ## ABNF.
+# document = *toplevel
+#
+# toplevel =
+#   t-constant
+# / t-enumeration
+# / t-type
+# / t-array
+# / t-func
+# / t-proc
+#
+# t-constant =
+#   "constant" type-ref ident "=" expr ";"
+#
+# t-enumeration =
+#   "enumeration" ident "{" [ ident *("," ident) ] "}" ";"
+#
+# t-type =
+#   "type" composite-name ";"
+# / "type" composite-name "=" type-ref ";"
+# / "type" composite-name "is" param-list
+#
+# t-array =
+#   "array" type-ref ident "[" int ".." int "]" ";"
+#
+# t-func = ...
+#
+# t-proc =
+#   composite-name param-list (";" / block)
+# / composite-name bracket-param-list "=" type-ref ident (";" / block)
+# / composite-name "=" type-ref ident (";" / block)
+# 
+# t-func =
+#   composite-name (";" / block)
+# / composite-name param-list (";" / block)
+#
+# param-list =
+#   "(" param-list-inner ")"
+#
+# bracket-param-list =
+#   "[" param-list-inner "]"
+#
+# param-list-inner =
+#   [type-ref ident *("," type-ref ident)]
+#
+# type-ref =
+#   type-ref-inner ["&"]
+#
+# type-ref-inner =
+#   "boolean"
+# / "integer"
+# / "real"
+# / "bit"
+# / "bits" "(" expr ")"
+# / "(" type-ref *("," type-ref) ")"
+# / composite-name
+#
+# composite-name =
+#   ident *("." ident)
+#
+# block =
+#   INDENT *stmt DEDENT
+#
+# stmt =
+#   s-if
+# / s-case
+# / s-repeat
+# / s-while
+# / s-for
+# / s-try
+# / s-constant
+# / s-UNDEFINED
+# / s-UNPREDICTABLE
+# / s-CONSTRAINED_UNPREDICTABLE
+# / s-SEE
+# / s-IMPDEF
+# / s-IMPLEMENTATION_DEFINED
+# / s-return
+# / s-assert
+# / s-assign
+# / s-decl
+# / s-expr
+#
+# block-or-stmt =
+#   block
+# / stmt
+#
+# s-case =
+#   "case" expr "of" INDENT *s-case-entry ["otherwise" block-or-stmt] DEDENT
+#
+# s-case-entry =
+#   *("when" expr *("," expr)) block-or-stmt
+#
+# s-UNDEFINED =
+#   "UNDEFINED" ";"
+#
+# s-UNPREDICTABLE =
+#   "UNPREDICTABLE" ";"
+#
+# s-IMPLEMENTATION_DEFINED =
+#   "IMPLEMENTATION_DEFINED" [QSTRING] ";"
+#
+# s-while =
+#   "while" expr "do" block
+#
+# s-repeat =
+#   "repeat" block "until" expr ";"
+#
+# s-for =
+#   "for" ident "=" expr ("to" / "downto") expr block-or-stmt
+#
+# s-if =
+#   "if" expr "then" block-or-stmt *("elsif" expr "then" block-or-stmt) ["else" block-or-stmt]
+#
+# s-constant =
+#   type-ref ident "=" expr ";"
+#
+# s-assert =
+#   "assert" expr ";"
+#
+# s-return =
+#   "return" [expr] ";"
+#
+# s-expr =
+#   expr ";"
+#
+# s-assign =
+#   expr "=" expr ";"
+#
+# s-decl =
+#   type-ref name ["=" expr] *("," name ["=" expr]) ";"
+#
+# expr = e-100
+#
+# e-100 = e-120 *("||" e-120)
+#
+# e-120 = e-130 *("&&" e-130)
+#
+# e-130 = e-140 ["IN" set-expr]
+# 
+# set-expr = "{" [expr *("," expr)] "}"
+#
+# e-140 = e-160 *("OR" e-160)
+#
+# e-160 = e-180 *("EOR" e-180)
+#
+# e-180 = e-200 *("AND" e-200)
+#
+# e-200 = e-220 *(("==" / "!=") e-220)
+#
+# e-220 = e-240 *(("<" / "<=" / ">" / ">=") e-240)
+#
+# e-240 = e-260 *(("<<" / ">>") e-260)
+#
+# e-260 = e-280 *(("+" / "-") e-280)
+#
+# e-280 = e-290 *(("*" / "DIV" / "MOD" / "REM" / ":" / "/") e-290)
+#
+# e-290 = e-300 ["^" e-300]
+#
+# e-300 =
+#   "!" e-320
+# / "-" e-320
+# / "NOT" e-320
+# / "<" range-expr ">"
+# / "if" e-100 "then" e-100 *("elsif" e-100 "then" e-100) ["else" e-100]
+# / e-320
+#
+# e-320 =
+#   e-340 "(" [e-100 *("," e-100)] ")"
+# / e-340 "<" range-expr ">"
+# / e-340 "[" [expr *("," expr)] "]"
+# / e-340 "." "<" range-expr ">"
+# / e-340 "." e-340
+# / e-340
+#
+# range-expr =
+#   range-expr-inner *("," range-expr-inner)
+#
+# range-expr-inner =
+#   e-240 [(":" / "+:") e-240]
+#
+# e-340 =
+#   "(" tuple-elem *("," tuple-elem) ")"
+# / type-ref "UNKNOWN"
+# / type-ref "IMPLEMENTATION_DEFINED" [QSTRING]
+# / ident
+# / int
+# / float
+# / bitstring
+# / "FALSE"
+# / "TRUE"
+#
+# tuple-elem =
+#   e-100
+# / "-"
+
+def parseParamList(L, allowBrackets=False):
+  params = []
+
+  Tlparen = L.read()
+  if Tlparen.type != tokLPAREN and (not allowBrackets or Tlparen.type != tokLBRACKET):
+    raise Exception('expected left parenthesis for parameter list: %s' % Tlparen)
+
+  t2 = L.read()
+  if (Tlparen.type == tokLPAREN and t2.type == tokRPAREN) or (Tlparen.type == tokLBRACKET and t2.type == tokRBRACKET):
+    return params
+
+  L.push(t2)
+
+  L.inhibitIndent += 1
+  while True:
+    Ttyperef = parseTypeRef(L)
+    if Ttyperef is None:
+      raise Exception("couldn't parse type reference in param list: %s" % Ttyperef)
+
+    Tident = L.read()
+    if Tident.type != tokIDENT:
+      raise Exception('expected ident in param list: %s' % Tident)
+
+    params.append((Ttyperef, Tident))
+
+    Tnext = L.read()
+    if (Tlparen.type == tokLPAREN and Tnext.type == tokRPAREN) or (Tlparen.type == tokLBRACKET and Tnext.type == tokRBRACKET):
+      break
+    elif Tnext.type != tokCOMMA:
+      raise Exception('expected comma or end of parameter list: %s' % Tnext)
+
+  L.inhibitIndent -= 1
+  return params
+
+
+#  expression100  ::= expressionU [("||") expressionU]
+#  expression120  ::= expressionV [("&&") expressionV]
+#  expression130  :=  expression  [("IN") expression ]
+#  expression140  ::= expressionW [("OR") expressionW]
+#  expression160  ::= expressionX [("EOR") expressionX]
+#  expression180  ::= expressionY [("AND") expressionY]
+#  expression200  ::= expressionZ [("==" / "!=") expressionZ]
+#  expression220  ::= expression0 [("<" / "<=" / ">" / ">=") expression0]
+#  expression240  ::= expression1 [(">>" / "<<"    ) expression1]
+#  expression260  ::= expression2 [("+" / "-"      ) expression2]
+#  expression280  ::= expression3 [("*" / "/" / "%" / ":") expression3]
+#  expression300  ::= expression320
+#  expression320  ::= expression340 ["(" call-args ")" / "<" range-expr ">" / "[" expr "]"]
+#  expression340  ::= ident / literal / "(" expression100 ")"
+
+def parseTupleElementExpr(L):
+  t = L.read()
+  if t.type == tokMINUS:
+    t2 = L.read()
+    if t2.type == tokCOMMA or t2.type == tokRPAREN:
+      L.push(t2)
+      return Node('tuple-nomatch', ())
+    else:
+      L.push(t)
+      L.push(t2)
+      l = parseExpr100(L)
+      return l
+  else:
+    L.push(t)
+    l = parseExpr100(L)
+    return l
+
+def parseExpr340(L):
+  t = L.read()
+  if t.type == tokLPAREN:
+    l = parseTupleElementExpr(L)
+    t2 = L.read()
+    ls = [l]
+    if t2.type == tokCOMMA:
+      while True:
+        ls.append(parseTupleElementExpr(L))
+        t3 = L.read()
+        if t3.type == tokRPAREN:
+          break
+        elif t3.type == tokCOMMA:
+          pass
+        else:
+          raise Exception("expected comma or right parenthesis continuing or ending tuple expression: %s" % t3)
+    elif t2.type != tokRPAREN:
+      raise Exception("expected closing parenthesis for expression")
+
+    if len(ls) == 1:
+      return l
+    else:
+      return Node('e-tuple', (tuple(ls),))
+
+  old = L.save()
+  try:
+    L.push(t)
+    tr = parseTypeRef(L)
+  except:
+    tr = None
+  if tr is None:
+    L.restore(old)
+  else:
+    Tunk = L.read()
+    if Tunk.type == keywords['UNKNOWN']:
+      return Node('e-unknown', ())
+    elif Tunk.type == keywords['IMPLEMENTATION_DEFINED']:
+      Tstr = L.read()
+      if Tstr.type != tokQSTRING:
+        L.push(Tstr)
+        Tstr = None
+      return Node('e-implementation-defined', (Tstr,))
+    else:
+      L.restore(old)
+
+  if t.type != tokIDENT and t.type != tokINT and t.type != tokFLOAT and t.type != tokBITSTRING and t.type != keywords['FALSE'] and t.type != keywords['TRUE']:
+    raise Exception("expected identifier or literal, got %s" % t)
+
+  return t
+
+def parseRangeExpr2(L):
+  l = parseExpr260(L, False)
+  t = L.read()
+  if t.type == tokCOLON or t.type == tokPLUSCOLON:
+    r = parseExpr260(L, False)
+    return Node('range2', (l,r))
+  else:
+    L.push(t)
+    return Node('range2', (l,None))
+
+def parseRangeExpr(L):
+  l = parseRangeExpr2(L)
+  t = L.read()
+  ls = [l]
+  while t.type == tokCOMMA:
+    ls.append(parseRangeExpr2(L))
+    t = L.read()
+
+  L.push(t)
+  return Node('range', tuple(ls))
+
+def parseExpr320(L):
+  l = parseExpr340(L)
+  N = l
+  while True:
+    t = L.read()
+    if t.type == tokLPAREN:
+      t2 = L.read()
+      if t2.type == tokRPAREN:
+        N = Node('e-call', (N, ()))
+      else:
+        L.push(t2)
+
+        args = []
+        while True:
+          arg = parseExpr100(L)
+          args.append(arg)
+          t = L.read()
+          if t.type == tokRPAREN:
+            break
+          elif t.type != tokCOMMA:
+            raise Exception("expected comma or right parenthesis in argument list")
+
+        N = Node('e-call', (N, tuple(args)))
+    elif t.type == tokLT:
+      old = L.save()
+      r = parseRangeExpr(L)
+      t2 = L.read()
+      if t2.type != tokGT:
+        L.restore(old)
+        L.push(t)
+        break
+
+      N = Node('e-range', (N, r))
+    elif t.type == tokLBRACKET:
+      t2 = L.read()
+      if t2.type == tokRBRACKET:
+        N = Node('e-indexempty', (N,))
+        continue
+
+      L.push(t2)
+      args = []
+      while True:
+        r = parseExpr(L)
+        args.append(r)
+        t = L.read()
+        if t.type == tokRBRACKET:
+          break
+        elif t.type == tokCOMMA:
+          pass
+        else:
+          raise Exception("expected ] to end subscript operator: %s" % t)
+
+      N = Node('e-index', (N,tuple(args)))
+    elif t.type == tokPERIOD:
+      t2 = L.read()
+      if t2.type == tokLT:
+        r = parseRangeExpr(L)
+        t3 = L.read()
+        if t3.type != tokGT:
+          raise Exception('expected > ending .<> expression: %s' % t3)
+        N = Node('e-subrange', (N, r))
+      else:
+        L.push(t2)
+        r = parseExpr340(L)
+        N = Node('e-subscript', (N, r))
+    else:
+      L.push(t)
+      break
+
+  return N
+
+def parseExprTernary(L, Tif):
+  e = parseExpr100(L)
+
+  t = L.read()
+  if t.type != keywords['then']:
+    raise Exception('expected then after ternary expression at %s' % t)
+
+  Et = parseExpr100(L)
+
+  t2 = L.read()
+  if t2.type == keywords['elsif']:
+    return Node('e-ternary', (e,Et,parseExprTernary(L, t2)))
+
+  if t2.type != keywords['else']:
+    raise Exception('expected else after ternary expression at %s' % t2)
+
+  Ef = parseExpr100(L)
+  return Node('e-ternary', (e,Et,Ef))
+
+def parseExpr300(L):
+  t = L.read()
+  if t.type == tokBANG:
+    return Node('e-not', (parseExpr320(L),))
+  elif t.type == tokMINUS:
+    return Node('e-negate', (parseExpr320(L),))
+  elif t.type == keywords['NOT']:
+    return Node('e-lnegate', (parseExpr320(L),))
+  elif t.type == tokLT:
+    r = parseRangeExpr(L)
+    if r is None:
+      raise Exception('expected valid range expression at %s' % t)
+
+    t2 = L.read()
+    if t2.type != tokGT:
+      raise Exception('expected > ending range expression at %s' % t2)
+
+    return r
+  elif t.type == keywords['if']:
+    return parseExprTernary(L, t)
+  else:
+    L.push(t)
+    return parseExpr320(L)
+
+def parseExpr290(L):
+  l = parseExpr300(L)
+  t = L.read()
+  N = l
+  if t.type == tokCARET:
+    N = Node('e-exp', (N,parseExpr300(L)))
+  else:
+    L.push(t)
+  return N
+
+def parseExpr280(L, allowColon=True):
+  l = parseExpr290(L)
+  t = L.read()
+  N = l
+  while t.type == tokASTERISK or t.type == keywords['DIV'] or t.type == keywords['MOD'] or t.type == keywords['REM'] or (t.type == tokCOLON and allowColon) or t.type == tokSLASH:
+    if t.type == tokASTERISK:
+      N = Node('e-mul', (N, parseExpr290(L)))
+    elif t.type == keywords['DIV']:
+      N = Node('e-div', (N, parseExpr290(L)))
+    elif t.type == keywords['MOD']:
+      N = Node('e-mod', (N, parseExpr290(L)))
+    elif t.type == keywords['REM']:
+      N = Node('e-rem', (N, parseExpr290(L)))
+    elif t.type == tokCOLON and allowColon:
+      N = Node('e-concat', (N, parseExpr290(L)))
+    elif t.type == tokSLASH:
+      N = Node('e-fdiv', (N, parseExpr290(L)))
+    t = L.read()
+  L.push(t)
+  return N
+
+def parseExpr260(L, allowColon=True):
+  l = parseExpr280(L, allowColon)
+  t = L.read()
+  N = l
+  while t.type == tokPLUS or t.type == tokMINUS:
+    if t.type == tokPLUS:
+      N = Node('e-add', (N, parseExpr280(L)))
+    else:
+      N = Node('e-sub', (N, parseExpr280(L)))
+    t = L.read()
+  L.push(t)
+  return N
+
+def parseExpr240(L):
+  l = parseExpr260(L)
+  t = L.read()
+  N = l
+  while t.type == tokLSH or t.type == tokRSH:
+    if t.type == tokLSH:
+      N = Node('e-lsh', (N, parseExpr260(L)))
+    else:
+      N = Node('e-rsh', (N, parseExpr260(L)))
+    t = L.read()
+  L.push(t)
+  return N
+
+def parseExpr220(L):
+  l = parseExpr240(L)
+  t = L.read()
+  N = l
+  while t.type == tokLT or t.type == tokLE or t.type == tokGT or t.type == tokGE:
+    if t.type == tokLT:
+      N = Node('e-lt', (N, parseExpr240(L)))
+    elif t.type == tokLE:
+      N = Node('e-le', (N, parseExpr240(L)))
+    elif t.type == tokGT:
+      N = Node('e-gt', (N, parseExpr240(L)))
+    else:
+      N = Node('e-ge', (N, parseExpr240(L)))
+
+    t = L.read()
+  L.push(t)
+  return N
+
+def parseExpr200(L):
+  l = parseExpr220(L)
+  t = L.read()
+  N = l
+  while t.type == tokEQEQ or t.type == tokNE:
+    if t.type == tokEQEQ:
+      N = Node('e-eq', (N, parseExpr220(L)))
+    else:
+      N = Node('e-ne', (N, parseExpr220(L)))
+    t = L.read()
+  L.push(t)
+  return N
+
+def parseExpr180(L):
+  l = parseExpr200(L)
+  t = L.read()
+  ls = [l]
+  while t.type == keywords['AND']:
+    ls.append(parseExpr200(L))
+    t = L.read()
+  L.push(t)
+  if len(ls) > 1:
+    return Node('e-and', tuple(ls))
+  else:
+    return l
+
+def parseExpr160(L):
+  l = parseExpr180(L)
+  t = L.read()
+  ls = [l]
+  while t.type == keywords['EOR']:
+    ls.append(parseExpr180(L))
+    t = L.read()
+  L.push(t)
+  if len(ls) > 1:
+    return Node('e-eor', tuple(ls))
+  else:
+    return l
+
+def parseExpr140(L):
+  l = parseExpr160(L)
+  t = L.read()
+  ls = [l]
+  while t.type == keywords['OR']:
+    ls.append(parseExpr160(L))
+    t = L.read()
+  L.push(t)
+  if len(ls) > 1:
+    return Node('e-or', tuple(ls))
+  else:
+    return l
+
+def parseSetExpr(L):
+  t = L.read()
+  if t.type != tokLBRACE:
+    raise Exception('expected left brace beginning set expression: %s' % t)
+  ls = []
+  while True:
+    ls.append(parseExpr(L))
+    t2 = L.read()
+    if t2.type == tokRBRACE:
+      break
+    elif t2.type == tokCOMMA:
+      pass
+    else:
+      raise Exception('expected comma or right brace in set expression: %s' % t)
+  return Node('e-set', tuple(ls))
+
+def parseExpr130(L):
+  l = parseExpr140(L)
+  t = L.read()
+  if t.type == keywords['IN']:
+    return Node('e-set-in', (l,parseSetExpr(L)))
+  else:
+    L.push(t)
+    return l
+
+def parseExpr120(L):
+  l = parseExpr130(L)
+  t = L.read()
+  ls = [l]
+  while t.type == tokLAND:
+    ls.append(parseExpr130(L))
+    t = L.read()
+  L.push(t)
+  if len(ls) > 1:
+    return Node('e-land', tuple(ls))
+  else:
+    return l
+
+def parseExpr100(L):
+  l = parseExpr120(L)
+  t = L.read()
+  ls = [l]
+  while t.type == tokLOR:
+    ls.append(parseExpr120(L))
+    t = L.read()
+  L.push(t)
+  if len(ls) > 1:
+    return Node('e-lor', tuple(ls))
+  else:
+    return l
+
+def parseExpr(L, inhibit=1):
+  L.inhibitIndent += inhibit
+  r = parseExpr100(L)
+  L.inhibitIndent -= inhibit
+  return r
+
+def parseManyStmt(L):
+  stmts = []
+  while True:
+    T = L.read()
+    L.push(T)
+    if L.eof:
+      break
+
+    stmt = parseStmt(L)
+    stmts.append(stmt)
+
+  return Node('s-block', tuple(stmts))
+
+def parseBlock(L):
+  Tindent = L.read()
+  if Tindent.type != tokINDENT:
+    raise Exception('expected statement block to begin with indent: %s' % Tindent)
+
+  stmts = []
+  while True:
+    stmt = parseStmt(L)
+    stmts.append(stmt)
+
+    Tdedent = L.read()
+    if Tdedent.type == tokDEDENT:
+      break
+    else:
+      L.push(Tdedent)
+
+  return Node('s-block', tuple(stmts))
+
+def parseBlockOrStmt(L):
+  t = L.read()
+  if t.type == tokINDENT:
+    L.push(t)
+    return parseBlock(L)
+
+  L.push(t)
+  return parseStmt(L)
+
+def parseStmtIf(L, Tif):
+  expr = parseExpr(L)
+  Tthen = L.read()
+  if Tthen.type != keywords['then']:
+    raise Exception('expected "then" after if expression: %s' % Tthen)
+
+  body = parseBlockOrStmt(L)
+
+  Trem = L.read()
+  if Trem.type == keywords['else']:
+    elseBody = parseBlockOrStmt(L)
+    return Node('s-if', (expr,body,elseBody))
+  elif Trem.type == keywords['elsif']:
+    elseBody = parseStmtIf(L, Trem)
+    return Node('s-if', (expr,body,elseBody))
+  else:
+    L.push(Trem)
+    return Node('s-if', (expr,body,None))
+
+def parseStmtFor(L, Tfor):
+  Tvarname = L.read()
+  if Tvarname.type != tokIDENT:
+    raise Exception('expected identifier after for: %s' % Tvarname)
+
+  Teq = L.read()
+  if Teq.type != tokEQ:
+    raise Exception('expected = in for: %s' % Teq)
+
+  Einit = parseExpr(L)
+
+  Tto = L.read()
+  if Tto.type != keywords['to'] and Tto.type != keywords['downto']:
+    raise Exception('expected to in for: %s' % Tto)
+
+  L.inhibitIndent -= 1
+  Elast = parseExpr(L)
+  L.inhibitIndent += 1
+
+  body = parseBlockOrStmt(L)
+
+  if Tto.type == keywords['to']:
+    return Node('s-for-up', (Tvarname, Einit, Elast, body))
+  else:
+    return Node('s-for-down', (Tvarname, Einit, Elast, body))
+
+def parseStmtDecl(L):
+  ty = parseTypeRef(L)
+  if ty is None:
+    raise Exception('could not parse type reference: %s' % ty)
+
+  decls = []
+  while True:
+    t = L.read()
+    if t.type != tokIDENT:
+      raise Exception('expected identifier in local declaration: %s' % t)
+
+    t2 = L.read()
+    if t2.type == tokSEMICOLON:
+      decls.append(Node('s-decl', (ty,t,None)))
+      break
+
+    if t2.type == tokCOMMA:
+      decls.append(Node('s-decl', (ty,t,None)))
+      continue
+
+    if t2.type != tokEQ:
+      raise Exception('expected "=", "," or ";" in local declaration: %s' % t2)
+
+    r = parseExpr(L)
+    decls.append(Node('s-decl', (ty,t,r)))
+
+    t3 = L.read()
+    if t3.type == tokSEMICOLON:
+      break
+    elif t3.type != tokCOMMA:
+      raise Exception('expected comma after local declaration init-expression: %s' % t3)
+
+  return Node('s-decls', (ty, tuple(decls)))
+
+def parseStmtAssign(L):
+  T0 = L.read()
+  if T0.type == tokMINUS:
+    T1 = L.read()
+    if T1.type == tokEQ:
+      r = parseExpr(L)
+      T2 = L.read()
+      if T2.type != tokSEMICOLON:
+        raise Exception('expected ; terminating expression: %s' % T2)
+      return Node('s-expr', (r,))
+    else:
+      L.push(T0)
+      L.push(T1)
+  else:
+    L.push(T0)
+
+  l = parseExpr(L)
+  t = L.read()
+  if t.type != tokEQ:
+    raise Exception('expected = in assignment expression: %s' % t)
+  r = parseExpr(L)
+  t2 = L.read()
+  if t2.type != tokSEMICOLON:
+    raise Exception('expected ; terminating assignment expression: %s' % t2)
+  return Node('s-assign', (l, r))
+
+def parseStmtExpr(L):
+  l = parseExpr(L)
+  t = L.read()
+  if t.type != tokSEMICOLON:
+    raise Exception('expected ; terminating expression statement: %s' % t)
+  return Node('s-expr', (l,))
+
+def parseStmtAssignOrDecl(L):
+  old = L.save()
+  try:
+    return parseStmtAssign(L)
+  except Exception as e:
+    pass
+    #print(e)
+  L.restore(old)
+
+  try:
+    return parseStmtExpr(L)
+  except Exception as e:
+    pass
+    #print(e)
+  L.restore(old)
+
+  return parseStmtDecl(L)
+
+def parseStmtReturn(L, Treturn):
+  t = L.read()
+  if t.type == tokSEMICOLON:
+    return Node('s-return', (None,))
+
+  L.push(t)
+  e = parseExpr(L)
+  t2 = L.read()
+  if t2.type != tokSEMICOLON:
+    raise Exception('expected ; terminating return statement: %s' % t2)
+
+  return Node('s-return', (e,))
+
+def parseStmtAssert(L, Tassert):
+  e = parseExpr(L)
+  t = L.read()
+  if t.type != tokSEMICOLON:
+    raise Exception('expected ; terminating assert statement: %s' % t)
+
+  return Node('s-assert', (e,))
+
+def parseCase(L, Tcase):
+  e = parseExpr(L)
+  t = L.read()
+  if t.type != keywords['of']:
+    raise Exception('expected keyword "of": %s' % t)
+
+  t2 = L.read()
+  if t2.type != tokINDENT:
+    raise Exception('expected indent for case statement: %s' % t2)
+
+  cases = []
+  curMatches = []
+  other = None
+  while True:
+    t3 = L.read()
+    if t3.type == keywords['when']:
+      while True:
+        L.inhibitIndent -= 100
+        curMatches.append(parseExpr(L))
+        L.inhibitIndent += 100
+        t4 = L.read()
+        if t4.type == tokCOMMA:
+          continue
+        else:
+          L.push(t4)
+          break
+
+      t5 = L.read()
+      L.push(t5)
+      if t5.type != keywords['when']:
+        cases.append(Node('s-case-match', (tuple(curMatches), parseBlockOrStmt(L))))
+        curMatches = []
+    elif t3.type == keywords['otherwise']:
+      other = parseBlockOrStmt(L)
+      curMatches = []
+    elif t3.type == tokDEDENT:
+      break
+
+  return Node('s-case', (e,tuple(cases),other))
+
+def parseStmtUndefined(L, Tundefined):
+  t = L.read()
+  if t.type != tokSEMICOLON:
+    raise Exception('expected ; after UNDEFINED statement: %s' % t)
+
+  return Node('s-undefined', ())
+
+def parseStmtUnpredictable(L, Tunpredictable):
+  t = L.read()
+  if t.type != tokSEMICOLON:
+    raise Exception('expected ; after UNPREDICTABLE statement: %s' % t)
+
+  return Node('s-unpredictable', ())
+
+def parseStmtConstant(L, Tconstant):
+  tr = parseTypeRef(L)
+  if tr is None:
+    raise Exception('cannot parse type reference in constant definition: %s' % Tconstant)
+
+  Tname = L.read()
+  if Tname.type != tokIDENT:
+    raise Exception('expected identifier in constant definition: %s' % Tname)
+
+  Teq = L.read()
+  if Teq.type != tokEQ:
+    raise Exception('expected = in constant definition: %s' % Teq)
+
+  expr = parseExpr(L)
+  
+  Tsemi = L.read()
+  if Tsemi.type != tokSEMICOLON:
+    raise Exception('expected ; terminating constant definition: %s' % Tsemi)
+
+  return Node('s-constant', (tr,Tname,expr))
+
+def parseStmtRepeat(L, Trepeat):
+  blk = parseBlock(L)
+
+  Tuntil = L.read()
+  if Tuntil.type != keywords['until']:
+    raise Exception('expected "until" terminating repeat block: %s' % Tuntil)
+
+  expr = parseExpr(L)
+
+  Tsemi = L.read()
+  if Tsemi.type != tokSEMICOLON:
+    raise Exception('expected ; terminating until of repeat statement: %s' % Tsemi)
+
+  return Node('s-repeat', (blk,expr))
+
+def parseStmtWhile(L, Twhile):
+  expr = parseExpr(L)
+
+  Tdo = L.read()
+  if Tdo.type != keywords['do']:
+    raise Exception('expected "do" beginning while block: %s' % Tdo)
+
+  blk = parseBlock(L)
+
+  return Node('s-while', (expr,blk))
+
+def parseStmtImplementationDefined(L, TimplementationDefined):
+  Tstr = L.read()
+  if Tstr.type != tokQSTRING:
+    L.push(Tstr)
+    Tstr = None
+
+  Tsemi = L.read()
+  if Tsemi.type != tokSEMICOLON:
+    raise Exception('expected semicolon terminating IMPLEMENTATION_DEFINED: %s' % Tsemi)
+
+  return Node('s-implementation-defined', (Tstr,))
+
+def parseStmtSee(L, Tsee):
+  Tstr = L.read()
+  if Tstr.type != tokQSTRING:
+    raise Exception('expected quoted string after SEE: %s' % Tsee)
+
+  Tsemi = L.read()
+  if Tsemi.type != tokSEMICOLON:
+    raise Exception('expected semicolon terminating SEE: %s' % Tsemi)
+
+  return Node('s-see', (Tstr,))
+
+def parseStmt(L):
+  t = L.read()
+  if t.type == keywords['if']:
+    return parseStmtIf(L, t)
+  if t.type == keywords['case']:
+    return parseCase(L, t)
+  if t.type == keywords['repeat']:
+    return parseStmtRepeat(L, t)
+  if t.type == keywords['while']:
+    return parseStmtWhile(L, t)
+  if t.type == keywords['for']:
+    return parseStmtFor(L, t)
+  if t.type == keywords['try']:
+    raise Exception('try TODO')
+  if t.type == keywords['constant']:
+    return parseStmtConstant(L, t)
+  if t.type == keywords['UNDEFINED']:
+    return parseStmtUndefined(L, t)
+  if t.type == keywords['UNPREDICTABLE']:
+    return parseStmtUnpredictable(L, t)
+  if t.type == keywords['CONSTRAINED_UNPREDICTABLE']:
+    raise Exception('CONSTRAINED_UNPREDICTABLE TODO')
+  if t.type == keywords['SEE']:
+    return parseStmtSee(L, t)
+  if t.type == keywords['IMPDEF']:
+    raise Exception('IMPDEF TODO')
+  if t.type == keywords['IMPLEMENTATION_DEFINED']:
+    return parseStmtImplementationDefined(L, t)
+  if t.type == keywords['return']:
+    return parseStmtReturn(L, t)
+  if t.type == keywords['assert']:
+    return parseStmtAssert(L, t)
+  if t.type == keywords['enumeration']:
+    return parseEnumeration(L, t)
+
+  L.push(t)
+  return parseStmtAssignOrDecl(L)
+
+def parseCompositeName(L):
+  t = L.read()
+  if t.type != tokIDENT:
+    L.push(t)
+    return None
+
+  N = t
+  while True:
+    t2 = L.read()
+    if t2.type != tokPERIOD:
+      L.push(t2)
+      break
+
+    t3 = L.read()
+    if t3.type != tokIDENT:
+      L.push(t3)
+      raise Exception('cannot parse composite name, identifier expected: %s' % t3)
+
+    N = Node('namesub', (N,t3))
+
+  return N
+
+def parseFuncDef(L, returnTypeRef):
+  name = parseCompositeName(L)
+  if name is None:
+    return None
+
+  Tlparen = L.read()
+  if Tlparen.type == tokINDENT:
+    L.push(Tlparen)
+    body = parseBlock(L)
+    return Node('func-def-var-get', (returnTypeRef, name, None, body))
+  elif Tlparen.type == tokSEMICOLON:
+    return Node('func-def-var-get', (returnTypeRef, name, None, None))
+
+  L.push(Tlparen)
+  params = parseParamList(L, True)
+
+  t = L.read()
+  if t.type == tokSEMICOLON:
+    return Node('func-def', (returnTypeRef, name, params, None))
+
+  L.push(t)
+  body = parseBlock(L)
+  return Node('func-def', (returnTypeRef, name, params, body))
+
+def parseProcDef(L):
+  name = parseCompositeName(L)
+  if name is None:
+    raise Exception('expected ident for name of procedure definition: %s' % name)
+
+  Tlparen = L.read()
+  isVarLike = Tlparen.type == tokEQ
+  isArrayLike = Tlparen.type == tokLBRACKET
+  L.push(Tlparen)
+
+  if isVarLike:
+    params = None
+  else:
+    params = parseParamList(L, True)
+
+  Trty = None
+  Tident = None
+  if isArrayLike or isVarLike:
+    t2 = L.read()
+    if t2.type != tokEQ:
+      raise Exception('expected = after array-like procedure definition: %s' % t2)
+
+    Trty = parseTypeRef(L)
+    if Trty is None:
+      raise Exception("couldn't parse type reference for value: %s" % Trty)
+
+    Tident = L.read()
+    if Tident.type != tokIDENT:
+      raise Exception('expected ident in param list: %s' % Tident)
+
+  t = L.read()
+  if t.type == tokSEMICOLON:
+    body = None
+  else:
+    L.push(t)
+    body = parseBlock(L)
+
+  if isVarLike:
+    return Node('proc-def-var', (None, name, params, body, Trty, Tident))
+  elif isArrayLike:
+    return Node('proc-def-array', (None, name, params, body, Trty, Tident))
+  else:
+    return Node('proc-def', (None, name, params, body, Trty, Tident))
+
+def parseTypeRef(L):
+  r = parseTypeRef_(L)
+  if r is not None:
+    t = L.read()
+    if t.type != tokAMPERSAND:
+      L.push(t)
+
+  return r
+
+def parseTypeRef_(L):
+  old = L.save()
+  t = L.read()
+
+  if t.type == keywords['boolean']:
+    return tBoolean
+  if t.type == keywords['integer']:
+    return tInteger
+  if t.type == keywords['real']:
+    return tReal
+  if t.type == keywords['bit']:
+    return Type('bits',  1)
+  if t.type == keywords['bits']:
+    Tlp  = L.read()
+    if Tlp.type != tokLPAREN:
+      L.push(t)
+      L.push(Tlp)
+      return None
+
+    expr = parseExpr(L)
+    #if expr is None:
+    #  print('expected expr')
+    #  L.restore(old)
+    #  return None
+
+    #Tint = L.read()
+    #if Tint.type != tokINT and Tint.type != tokIDENT:
+    #  L.push(t)
+    #  L.push(Tlp)
+    #  L.push(Tint)
+    #  return None
+
+    Trp  = L.read()
+    if Trp.type != tokRPAREN:
+      L.restore(old)
+      #L.push(t)
+      #L.push(Tlp)
+      #L.push(Tint)
+      #L.push(Trp)
+      return None
+
+    return Type('bits', expr)
+
+  if t.type == tokLPAREN:
+    sub = parseTypeRef(L)
+    if sub is None:
+      L.push(t)
+      return None
+
+    subs = [sub]
+    while True:
+      t2 = L.read()
+      if t2.type == tokRPAREN:
+        return Type('TUPLE', subs)
+      elif t2.type == tokCOMMA:
+        sub2 = parseTypeRef(L)
+        if sub2 is None:
+          raise Exception('cannot parse type expression inside tuple type expression')
+        subs.append(sub2)
+      else:
+        raise Exception('expected right parenthesis or comma in tuple type expression: %s' % t2)
+
+  if t.type == tokIDENT:
+    chain = []
+    while True:
+      t2 = L.read()
+      if t2.type != tokPERIOD:
+        L.push(t2)
+        break
+
+      t3 = L.read()
+      if t3.type != tokIDENT:
+        raise Exception('expected identifier after . in type reference: %s' % t3)
+
+      chain.append(t3)
+
+    return Type('REF', t.arg)
+
+  L.push(t)
+  return None
+
+def parseConstant(L, Tconstant):
+  tr = parseTypeRef(L)
+  if tr is None:
+    raise Exception('cannot parse type in constant definition: %s' % Tconstant)
+
+  Tname = L.read()
+  if Tname.type != tokIDENT:
+    raise Exception('expected identifier for constant definition: %s' % Tname)
+
+  Teq = L.read()
+  if Teq.type != tokEQ:
+    raise Exception('expected = in constant definition: %s' % Teq)
+
+  expr = parseExpr(L)
+  
+  Tsemi = L.read()
+  if Tsemi.type != tokSEMICOLON:
+    raise Exception('expected semicolon in constant definition: %s' % Tsemi)
+
+  return Node('constant', (tr, Tname, expr))
+
+def parseEnumeration(L, Tenumeration):
+  Tname = L.read()
+  if Tname.type != tokIDENT:
+    raise Exception('expected identifier for enumeration definition: %s' % Tname)
+
+  Tlbrace = L.read()
+  if Tlbrace.type != tokLBRACE:
+    raise Exception('expected { for enumeration definition: %s' % Tlbrace)
+
+  L.inhibitIndent += 1
+
+  t = L.read()
+  if t.type == tokRBRACE:
+    return Node('enumeration', (Tname, None))
+
+  L.push(t)
+  items = []
+  while True:
+    t2 = L.read()
+    if t2.type != tokIDENT:
+      L.inhibitIndent -= 1
+      raise Exception('expected identifier inside enumeration definition: %s' % t)
+
+    items.append(t2)
+
+    t3 = L.read()
+    if t3.type == tokRBRACE:
+      break
+
+    if t3.type != tokCOMMA:
+      L.inhibitIndent -= 1
+      raise Exception('expected , after enumeration value name: %s' % t3)
+
+  L.inhibitIndent -= 1
+
+  t4 = L.read()
+  if t4.type != tokSEMICOLON:
+    raise Exception('expected ; after enumeration defniition: %s' % t4)
+
+  return Node('enumeration', (Tname, tuple(items)))
+
+def parseTypeDef(L, Ttype):
+  name = parseCompositeName(L)
+  if name is None:
+    return ParseFailure('type-def: expects identifier', Ttype)
+
+  Tis = L.read()
+  if Tis.type == tokSEMICOLON:
+    return Node('type-def-existence', (name,))
+
+  if Tis.type == tokEQ:
+    tr = parseTypeRef(L)
+
+    Tsemi = L.read()
+    if Tsemi.type != tokSEMICOLON:
+      return ParseFailure('type-def: expected ; after type alias definition', Tsemi)
+
+    return Node('type-def-alias', (name, tr))
+
+  if Tis.type != keywords['is']:
+    raise Exception('expected keyword "is" after name in type definition: %s' % Tis)
+
+  L.inhibitIndent += 1
+  pl = parseParamList(L)
+  L.inhibitIndent -= 1
+
+  #Tlparen = L.read()
+  #if Tlparen.type != tokLPAREN:
+  #  raise Exception('expected ( beginning type definition body: %s' % Tlparen)
+
+  return Node('type-def', (name, pl))
+
+def parseArray(L, Tarray):
+  tr = parseTypeRef(L)
+  if tr is None:
+    raise Exception('cannot parse array typeref at %s' % Tarray)
+
+  Tname = L.read()
+  if Tname.type != tokIDENT:
+    raise Exception('array definition expects identifier: %s' % Tname)
+
+  Tlbracket = L.read()
+  if Tlbracket.type != tokLBRACKET:
+    raise Exception('array definition expects left bracket: %s' % Tlbracket)
+
+  Tbegin = L.read()
+  if Tbegin.type != tokINT:
+    raise Exception('array definition expects integer: %s' % Tbegin)
+
+  Tperiodperiod = L.read()
+  if Tperiodperiod.type != tokPERIODPERIOD:
+    raise Exception('array definition expects "..": %s' % Tperiodperiod)
+
+  Tend = L.read()
+  if Tend.type != tokINT:
+    raise Exception('array definition expects integer: %s' % Tend)
+
+  Trbracket = L.read()
+  if Trbracket.type != tokRBRACKET:
+    raise Exception('array definition expects right bracket: %s' % Trbracket)
+
+  Tsemicolon = L.read()
+  if Tsemicolon.type != tokSEMICOLON:
+    raise Exception('array definition expects semicolon: %s' % Tsemicolon)
+
+  return Node('array', (tr,Tname,Tbegin,Tend))
+
+def parseToplevel(L):
+  t = L.read()
+  if t.type == tokEOF:
+    return
+  if t.type == keywords['constant']:
+    return parseConstant(L, t)
+  if t.type == keywords['enumeration']:
+    return parseEnumeration(L, t)
+  if t.type == keywords['type']:
+    return parseTypeDef(L, t)
+  if t.type == keywords['array']:
+    return parseArray(L, t)
+
+  L.push(t)
+  old = L.save()
+
+  tr = parseTypeRef(L)
+  if tr is not None:
+    r = parseFuncDef(L, tr)
+    if r is not None:
+      return r
+
+  L.restore(old)
+  return parseProcDef(L)
+
+def parse(code, f=parseToplevel):
+  L = Lexer(code)
+
+  tops = []
+  while not L.eof:
+    tops.append(f(L))
+
+  return tuple(tops)
+
+## Commands                                                                {{{1
+###############################################################################
+
+cmds = {}
+
+def loadAst(args):
+  if args.get('load-pickle'):
+    with open(args['input-dir'], 'rb') as f:
+      return pickle.load(f)
+
+  asl = readDir(args['input-dir'])
+  for k, v in asl.items():
+    print('================================= %s (%s)' % (v.name, v.rep_section))
+    print(v.code)
+
+    if v.rep_section == 'decode' or v.rep_section == 'execute':
+      f = parseManyStmt
+      v.isExpr = True
+    else:
+      f = parseToplevel
+      v.isExpr = False
+
+    v.tree = parse(v.code, f)
+
+  return asl
+
+#################################################
+def cmdPickleAst(args):
+  asl = loadAst(args)
+
+  with open(args['output-file'], 'wb') as f:
+    pickle.dump(asl, f, protocol=4)
+
+  return 0
+
+cmds['pickle-ast'] = cmdPickleAst
+
+#################################################
+def cmdDumpAst(args):
+  import yaml
+
+  asl = loadAst(args)
+
+  with open(args['output-file'], 'w') as f:
+    yaml.dump(asl, f)
+
+  return 0
+
+cmds['dump-ast'] = cmdDumpAst
+
+#################################################
+def cmdTranslate(args):
+  asl = loadAst(args)
+
+  with open(args['output-file'], 'w') as f:
+    armtrans.translate(asl, f)
+
+  return 0
+
+cmds['translate'] = cmdTranslate
+
+#################################################
+def run():
+  ap = argparse.ArgumentParser()
+  apSub = ap.add_subparsers(dest='cmd')
+
+  cmdPickleAst = apSub.add_parser('pickle-ast')
+  cmdPickleAst.add_argument('-P', action='store_true', dest='load-pickle', help='load from pickled data')
+  cmdPickleAst.add_argument('input-dir')
+  cmdPickleAst.add_argument('output-file')
+
+  cmdDumpAst = apSub.add_parser('dump-ast')
+  cmdDumpAst.add_argument('-P', action='store_true', dest='load-pickle', help='load from pickled data')
+  cmdDumpAst.add_argument('input-dir')
+  cmdDumpAst.add_argument('output-file')
+
+  cmdTranslate = apSub.add_parser('translate')
+  cmdTranslate.add_argument('-P', action='store_true', dest='load-pickle', help='load from pickled data')
+  cmdTranslate.add_argument('input-dir')
+  cmdTranslate.add_argument('output-file')
+
+  args = vars(ap.parse_args())
+  if args['cmd'] is None:
+    ap.print_usage()
+    return 2
+
+  return cmds[args['cmd']](args)
+
+if __name__ == '__main__':
+  sys.exit(run())
